@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <elf.h>
+#include <sys/resource.h>
+#include <sys/auxv.h>
 
 void *map_elf(const char *filename)
 {
@@ -71,21 +73,47 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	 */
 
 
-	for (Elf64_Half i = 0 ; i < progHeaderCount ; i++) {
-		if (progHeader->p_type == PT_LOAD) {
-			Elf64_Word protection = 0;
-			if (progHeader->p_flags & PF_W)
-				protection |= PROT_WRITE;
-			if (progHeader->p_flags & PF_R)
-				protection |= PROT_READ;
-			if (progHeader->p_flags & PF_X)
-				protection |= PROT_EXEC;
+	// for Non-PIE binaries
+	if (elfHeader->e_type == ET_EXEC) {
 
-			mmap(progHeader->p_vaddr, progHeader->p_memsz, PROT_WRITE | PROT_EXEC | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			memcpy(progHeader->p_vaddr, byte + progHeader->p_offset, progHeader->p_memsz);
-			mprotect(progHeader->p_vaddr, progHeader->p_memsz, protection);
+		for (Elf64_Half i = 0 ; i < progHeaderCount ; i++) {
+			if (progHeader->p_type == PT_LOAD) {
+				Elf64_Word protection = 0;
+				if (progHeader->p_flags & PF_W)
+					protection |= PROT_WRITE;
+				if (progHeader->p_flags & PF_R)
+					protection |= PROT_READ;
+				if (progHeader->p_flags & PF_X)
+					protection |= PROT_EXEC;
+
+				// to align values to be multiples of page size
+				Elf64_Addr align = ~(4095);
+				Elf64_Addr alignedAddr = progHeader->p_vaddr & align;
+				Elf64_Addr endAddress = progHeader->p_vaddr + progHeader->p_memsz;
+				Elf64_Addr alignedEndAddress = (endAddress + 4095) & align;
+				// calculate the totalSize which is page alligned in order to ensure
+				// that i dont give permisions outside the correct range
+				Elf64_Xword totalsize = alignedEndAddress - alignedAddr;
+
+				void *map = mmap(alignedAddr, totalsize, PROT_WRITE | PROT_EXEC | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+				memmove(progHeader->p_vaddr, byte + progHeader->p_offset, progHeader->p_filesz);
+
+				if (progHeader->p_filesz < progHeader->p_memsz) {
+					// this case can happen so we have to zero out the difference
+					memset(progHeader->p_vaddr + progHeader->p_filesz, 0, progHeader->p_memsz - progHeader->p_filesz);
+				}
+
+				mprotect(map, totalsize, protection);
+			}
+			progHeader++;
 		}
-		progHeader++;
+
+	}
+
+	// for PIE binaries
+	if (elfHeader->e_type == ET_DYN) {
+
 	}
 
 	/**
@@ -103,7 +131,104 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	 * Note: Beware of the AT_RANDOM, AT_PHDR entries, the application will crash if you do not set them up properly.
 	 */
 
-	void *sp = mmap(NULL, 4096, PROT_EXEC | PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	struct rlimit rlimit;
+	getrlimit(RLIMIT_STACK, &rlimit);
+	int stackSize = rlimit.rlim_cur;
+
+	void *sp = mmap(NULL, stackSize, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	// build stack from top to bot
+
+	char *stack = (char*)sp + stackSize;
+	// allign memory to 16 bytes
+	// sptr points to space outside the valid stack
+	ulong *sptr = (ulong*)((ulong)stack & (~15));
+	// bring it in scope
+	--sptr;
+
+	// setup auxv
+
+	// AT_NULL first
+	*sptr = 0;
+	sptr--;
+	*sptr = AT_NULL;
+	sptr--;
+
+	// AT_PHDR
+
+	*sptr = (byte + elfHeader->e_phoff);
+	sptr--;
+	*sptr = AT_PHDR;
+	sptr--;
+
+	// AT_PHENT
+	*sptr = elfHeader->e_phentsize;
+	sptr--;
+	*sptr = AT_PHENT;
+	sptr--;
+
+
+	// AT_PHNUM
+
+	*sptr = elfHeader->e_phnum;
+	sptr--;
+	*sptr = AT_PHNUM;
+	sptr--;
+
+	// AT_RANDOM
+
+	// generate 16 bytes with random values
+	char random[16] = {0};
+	for (int i = 0; i < 16 ; i++) {
+		random[i] = rand() % 255;
+	}
+
+	// pass the address
+	*sptr = (ulong)random;
+	sptr--;
+	*sptr = AT_RANDOM;
+	sptr--;
+
+	// AT_PAGESZ
+
+	*sptr = 4096;
+	sptr--;
+	*sptr = AT_PAGESZ;
+	sptr--;
+
+	// SET NULL
+	*sptr = 0;
+	sptr--;
+
+	// check number of env variables
+	char **Env = envp;
+	int numEnv = 0;
+	while (*Env) {
+		numEnv++;
+		Env++;
+	}
+
+	// set envp
+
+	for (int i = numEnv - 1 ; i >= 0 ; i--) {
+		*sptr = envp[i];
+		sptr--;
+	}
+	
+	// set NULL;
+	*sptr = 0;
+	sptr--;
+
+	for (int i = argc - 1 ; i >= 0 ; i--) {
+		*sptr = (ulong)argv[i];
+		sptr--;
+	}
+	
+	//set argc
+	*sptr = (ulong)argc;
+
+
+
 
 	/**
 	 * TODO: Support Static PIE Executables
@@ -121,7 +246,7 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 			"xor %%rbp, %%rbp\n"
 			"jmp *%1\n"
 			:
-			: "r"(sp + 4096), "r"(entry)
+			: "r"(sptr), "r"(entry)
 			: "memory"
 			);
 }
