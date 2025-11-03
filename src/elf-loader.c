@@ -177,14 +177,59 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	int stackSize = rlimit.rlim_cur;
 
 	void *sp = mmap(NULL, stackSize, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	// to help with null on when copying strings onto stack
+	memset(sp, 0, stackSize);
+
+	// find number of env variables
+	char **Env = envp;
+
+	int numEnv = 0;
+
+	while (*Env) {
+		numEnv++;
+		Env++;
+	}
 
 	// build stack from top to bot
 
 	char *stack = (char *)sp + stackSize;
-	// sptr points to space outside the valid stack
 
+	// insert the values on the stack using strcpy
+
+	// keep track of pointers for argv and envp
+	char *argvPointers[argc];
+
+	char *envpPointers[numEnv];
+
+	// copy the argv strings onto stack
+
+	for (int i = argc - 1; i >= 0 ; i--) {
+		// + 1 for NULL
+		int len = strlen(argv[i]) + 1;
+
+		stack -= len;
+		memcpy(stack, argv[i], len);
+		argvPointers[i] = stack;
+		// align stack
+		stack = (char *)((ulong)stack & (~15));
+	}
+
+	// copy the argc strings onto stack
+
+	for (int i = numEnv - 1 ; i >= 0 ; i--) {
+		// + 1 for NULL
+		int len = strlen(envp[i]) + 1;
+
+		stack -= len;
+		memcpy(stack, envp[i], len);
+		envpPointers[i] = stack;
+		// align stack
+		stack = (char *)((ulong)stack & (~15));
+	}
+
+	// continue with ulong* as not to deal with alignment since its going to be aligned everytime
 	ulong *sptr = (ulong *)((ulong)stack);
-	// bring it in scope
+
 	--sptr;
 
 	// setup auxv
@@ -207,7 +252,6 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	sptr--;
 	*sptr = AT_PHENT;
 	sptr--;
-
 
 	// AT_PHNUM
 
@@ -242,20 +286,10 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	*sptr = 0;
 	sptr--;
 
-	// check number of env variables
-	char **Env = envp;
-
-	int numEnv = 0;
-
-	while (*Env) {
-		numEnv++;
-		Env++;
-	}
-
 	// set envp
 
 	for (int i = numEnv - 1 ; i >= 0 ; i--) {
-		*sptr = (ulong)envp[i];
+		*sptr = (ulong)envpPointers[i];
 		sptr--;
 	}
 	// set NULL;
@@ -263,11 +297,15 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	sptr--;
 
 	for (int i = argc - 1 ; i >= 0 ; i--) {
-		*sptr = (ulong)argv[i];
+		*sptr = (ulong)argvPointers[i];
 		sptr--;
 	}
 	//set argc
 	*sptr = (ulong)argc;
+
+
+
+
 	void (*entry)() = (void(*)())(elfHeader->e_entry + loadBase);
 
 	// Transfer control
